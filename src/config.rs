@@ -22,7 +22,9 @@ impl Config {
         self.client_id.as_deref().unwrap_or(DEFAULT_CLIENT_ID)
     }
     pub fn client_secret(&self) -> &str {
-        self.client_secret.as_deref().unwrap_or(DEFAULT_CLIENT_SECRET)
+        self.client_secret
+            .as_deref()
+            .unwrap_or(DEFAULT_CLIENT_SECRET)
     }
 }
 

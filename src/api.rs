@@ -17,9 +17,7 @@ pub struct Client {
 impl Client {
     pub async fn new() -> Result<Self> {
         let config = config::load_config()?;
-        let tokens = config::load_tokens().context(
-            "Not logged in. Run `youtube login` first.",
-        )?;
+        let tokens = config::load_tokens().context("Not logged in. Run `youtube login` first.")?;
         Ok(Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -78,13 +76,15 @@ impl Client {
                     if status.is_success() {
                         return Ok(body);
                     }
-                    let msg = body["error"]["message"]
-                        .as_str()
-                        .unwrap_or("Unknown error");
+                    let msg = body["error"]["message"].as_str().unwrap_or("Unknown error");
                     anyhow::bail!("API error {}: {}", status, msg);
                 }
                 Err(e) if e.is_timeout() => {
-                    eprintln!("Request timed out (attempt {}/{})", attempt + 1, MAX_RETRIES);
+                    eprintln!(
+                        "Request timed out (attempt {}/{})",
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
                     last_error = Some(e);
                 }
                 Err(e) => return Err(e).context("Request failed"),
@@ -125,13 +125,15 @@ impl Client {
                     if status.is_success() {
                         return Ok(body);
                     }
-                    let msg = body["error"]["message"]
-                        .as_str()
-                        .unwrap_or("Unknown error");
+                    let msg = body["error"]["message"].as_str().unwrap_or("Unknown error");
                     anyhow::bail!("API error {}: {}", status, msg);
                 }
                 Err(e) if e.is_timeout() => {
-                    eprintln!("Request timed out (attempt {}/{})", attempt + 1, MAX_RETRIES);
+                    eprintln!(
+                        "Request timed out (attempt {}/{})",
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
                     last_error = Some(e);
                 }
                 Err(e) => return Err(e).context("Request failed"),
@@ -156,9 +158,7 @@ impl Client {
             return Ok(());
         }
         let body: serde_json::Value = resp.json().await?;
-        let msg = body["error"]["message"]
-            .as_str()
-            .unwrap_or("Unknown error");
+        let msg = body["error"]["message"].as_str().unwrap_or("Unknown error");
         anyhow::bail!("API error {}: {}", status, msg);
     }
 
@@ -208,10 +208,7 @@ impl Client {
         let data = self
             .get(
                 "videos",
-                &[
-                    ("part", "snippet,contentDetails,statistics"),
-                    ("id", &ids),
-                ],
+                &[("part", "snippet,contentDetails,statistics"), ("id", &ids)],
             )
             .await?;
 
@@ -241,10 +238,7 @@ impl Client {
                 arr.iter()
                     .map(|item| PlaylistInfo {
                         id: item["id"].as_str().unwrap_or("").to_string(),
-                        title: item["snippet"]["title"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string(),
+                        title: item["snippet"]["title"].as_str().unwrap_or("").to_string(),
                         count: item["contentDetails"]["itemCount"].as_u64().unwrap_or(0),
                     })
                     .collect()
@@ -281,10 +275,7 @@ impl Client {
                             .as_str()
                             .unwrap_or("")
                             .to_string(),
-                        title: item["snippet"]["title"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string(),
+                        title: item["snippet"]["title"].as_str().unwrap_or("").to_string(),
                         channel: item["snippet"]["videoOwnerChannelTitle"]
                             .as_str()
                             .unwrap_or("")
@@ -345,10 +336,7 @@ fn extract_video_ids(data: &serde_json::Value) -> Vec<String> {
 fn parse_video_detail(item: &serde_json::Value) -> VideoDetail {
     VideoDetail {
         id: item["id"].as_str().unwrap_or("").to_string(),
-        title: item["snippet"]["title"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
+        title: item["snippet"]["title"].as_str().unwrap_or("").to_string(),
         channel: item["snippet"]["channelTitle"]
             .as_str()
             .unwrap_or("")
