@@ -50,7 +50,13 @@ impl Client {
         Ok(())
     }
 
-    async fn get(&mut self, path: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
+    async fn send_with_retry<F>(
+        &mut self,
+        build_request: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+    {
         self.ensure_token().await?;
 
         let mut last_error = None;
@@ -61,13 +67,7 @@ impl Client {
                 tokio::time::sleep(delay).await;
             }
 
-            let resp = self
-                .http
-                .get(format!("{}/{}", BASE_URL, path))
-                .query(params)
-                .bearer_auth(&self.access_token)
-                .send()
-                .await;
+            let resp = build_request(&self.http, &self.access_token).send().await;
 
             match resp {
                 Ok(r) => {
@@ -93,53 +93,28 @@ impl Client {
         Err(last_error.unwrap()).context("Request failed after retries")
     }
 
+    async fn get(&mut self, path: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
+        let url = format!("{}/{}", BASE_URL, path);
+        let params = params.to_vec();
+        self.send_with_retry(|http, token| {
+            http.get(&url).query(&params).bearer_auth(token)
+        })
+        .await
+    }
+
     async fn post(
         &mut self,
         path: &str,
         params: &[(&str, &str)],
         body: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        self.ensure_token().await?;
-
-        let mut last_error = None;
-        for attempt in 0..MAX_RETRIES {
-            if attempt > 0 {
-                let delay = Duration::from_secs(1 << attempt);
-                eprintln!("Retrying in {:?}...", delay);
-                tokio::time::sleep(delay).await;
-            }
-
-            let resp = self
-                .http
-                .post(format!("{}/{}", BASE_URL, path))
-                .query(params)
-                .bearer_auth(&self.access_token)
-                .json(body)
-                .send()
-                .await;
-
-            match resp {
-                Ok(r) => {
-                    let status = r.status();
-                    let body: serde_json::Value = r.json().await?;
-                    if status.is_success() {
-                        return Ok(body);
-                    }
-                    let msg = body["error"]["message"].as_str().unwrap_or("Unknown error");
-                    anyhow::bail!("API error {}: {}", status, msg);
-                }
-                Err(e) if e.is_timeout() => {
-                    eprintln!(
-                        "Request timed out (attempt {}/{})",
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    last_error = Some(e);
-                }
-                Err(e) => return Err(e).context("Request failed"),
-            }
-        }
-        Err(last_error.unwrap()).context("Request failed after retries")
+        let url = format!("{}/{}", BASE_URL, path);
+        let params = params.to_vec();
+        let body = body.clone();
+        self.send_with_retry(|http, token| {
+            http.post(&url).query(&params).bearer_auth(token).json(&body)
+        })
+        .await
     }
 
     async fn delete(&mut self, path: &str, params: &[(&str, &str)]) -> Result<()> {
