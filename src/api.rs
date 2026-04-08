@@ -50,10 +50,7 @@ impl Client {
         Ok(())
     }
 
-    async fn send_with_retry<F>(
-        &mut self,
-        build_request: F,
-    ) -> Result<serde_json::Value>
+    async fn send_with_retry<F>(&mut self, build_request: F) -> Result<serde_json::Value>
     where
         F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
     {
@@ -96,10 +93,8 @@ impl Client {
     async fn get(&mut self, path: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
         let url = format!("{}/{}", BASE_URL, path);
         let params = params.to_vec();
-        self.send_with_retry(|http, token| {
-            http.get(&url).query(&params).bearer_auth(token)
-        })
-        .await
+        self.send_with_retry(|http, token| http.get(&url).query(&params).bearer_auth(token))
+            .await
     }
 
     async fn post(
@@ -112,7 +107,10 @@ impl Client {
         let params = params.to_vec();
         let body = body.clone();
         self.send_with_retry(|http, token| {
-            http.post(&url).query(&params).bearer_auth(token).json(&body)
+            http.post(&url)
+                .query(&params)
+                .bearer_auth(token)
+                .json(&body)
         })
         .await
     }
