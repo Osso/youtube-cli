@@ -4,6 +4,7 @@ use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
 };
+use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::time::Duration;
@@ -40,68 +41,35 @@ pub async fn login(client_id: &str, client_secret: &str) -> Result<Tokens> {
 
     let (auth_url, csrf_token) = client
         .authorize_url(CsrfToken::new_random)
-        .add_scope(Scope::new(
-            "https://www.googleapis.com/auth/youtube".to_string(),
-        ))
+        .add_scope(Scope::new("https://www.googleapis.com/auth/youtube".to_string()))
         .set_pkce_challenge(pkce_challenge)
         .url();
 
-    println!("Opening browser for authentication...");
-    open::that(auth_url.as_str())?;
+    open_auth_browser(auth_url.as_str())?;
 
     let code = wait_for_callback(listener, csrf_token)?;
+    let token_result = retry_request(
+        "Failed to exchange code for token",
+        "Token exchange",
+        || {
+            let verifier = PkceCodeVerifier::new(pkce_secret.clone());
+            client
+                .exchange_code(code.clone())
+                .set_pkce_verifier(verifier)
+                .request_async(&http_client)
+        },
+    )
+    .await?;
 
-    let mut last_error = None;
-    let mut token_result = None;
-
-    for attempt in 0..MAX_RETRIES {
-        if attempt > 0 {
-            let delay = Duration::from_secs(1 << attempt);
-            eprintln!("Retrying in {:?}...", delay);
-            tokio::time::sleep(delay).await;
-        }
-
-        let verifier = PkceCodeVerifier::new(pkce_secret.clone());
-        match client
-            .exchange_code(code.clone())
-            .set_pkce_verifier(verifier)
-            .request_async(&http_client)
-            .await
-        {
-            Ok(result) => {
-                token_result = Some(result);
-                break;
-            }
-            Err(e) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("timed out") || err_str.contains("Timeout") {
-                    eprintln!(
-                        "Token exchange timed out (attempt {}/{})",
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    last_error = Some(e);
-                } else {
-                    return Err(e).context("Failed to exchange code for token");
-                }
-            }
-        }
-    }
-
-    let token_result = token_result
-        .ok_or_else(|| last_error.unwrap())
-        .context("Failed to exchange code for token after retries")?;
-
-    let tokens = Tokens {
-        access_token: token_result.access_token().secret().to_string(),
-        refresh_token: token_result
-            .refresh_token()
-            .map(|t| t.secret().to_string())
-            .ok_or_else(|| anyhow::anyhow!("No refresh token received"))?,
-    };
-
+    let tokens = tokens_from_login_exchange(token_result)?;
     config::save_tokens(&tokens)?;
     Ok(tokens)
+}
+
+fn open_auth_browser(auth_url: &str) -> Result<()> {
+    println!("Opening browser for authentication...");
+    open::that(auth_url)?;
+    Ok(())
 }
 
 fn wait_for_callback(listener: TcpListener, expected_csrf: CsrfToken) -> Result<AuthorizationCode> {
@@ -149,46 +117,83 @@ pub async fn refresh_token(client_id: &str, client_secret: &str, refresh: &str) 
         .set_token_uri(TokenUrl::new(TOKEN_URL.to_string())?);
 
     let http_client = create_http_client();
-    let mut last_error = None;
+    let refresh_token = RefreshToken::new(refresh.to_string());
+    let token_result = retry_request("Failed to refresh token", "Token refresh", || {
+        client
+            .exchange_refresh_token(&refresh_token)
+            .request_async(&http_client)
+    })
+    .await?;
+
+    let tokens = Tokens {
+        access_token: token_result.access_token().secret().to_string(),
+        refresh_token: token_result
+            .refresh_token()
+            .map(|token| token.secret().to_string())
+            .unwrap_or_else(|| refresh.to_string()),
+    };
+
+    config::save_tokens(&tokens)?;
+    Ok(tokens)
+}
+
+fn tokens_from_login_exchange<T: TokenResponse>(token_result: T) -> Result<Tokens> {
+    let refresh_token = token_result
+        .refresh_token()
+        .map(|token| token.secret().to_string())
+        .ok_or_else(|| anyhow::anyhow!("No refresh token received"))?;
+
+    Ok(Tokens {
+        access_token: token_result.access_token().secret().to_string(),
+        refresh_token,
+    })
+}
+
+async fn retry_request<T, E, F, Fut>(
+    error_context: &str,
+    timeout_label: &str,
+    mut request: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<T, E>>,
+    E: std::error::Error + Send + Sync + 'static + std::fmt::Debug,
+{
+    let mut last_timeout = None;
 
     for attempt in 0..MAX_RETRIES {
-        if attempt > 0 {
-            let delay = Duration::from_secs(1 << attempt);
-            eprintln!("Retrying in {:?}...", delay);
-            tokio::time::sleep(delay).await;
-        }
+        sleep_for_retry(attempt).await;
 
-        match client
-            .exchange_refresh_token(&RefreshToken::new(refresh.to_string()))
-            .request_async(&http_client)
-            .await
-        {
-            Ok(result) => {
-                let tokens = Tokens {
-                    access_token: result.access_token().secret().to_string(),
-                    refresh_token: result
-                        .refresh_token()
-                        .map(|t| t.secret().to_string())
-                        .unwrap_or_else(|| refresh.to_string()),
-                };
-                config::save_tokens(&tokens)?;
-                return Ok(tokens);
+        match request().await {
+            Ok(result) => return Ok(result),
+            Err(error) if is_timeout_error(&error) => {
+                log_timeout(timeout_label, attempt + 1);
+                last_timeout = Some(format!("{error:?}"));
             }
-            Err(e) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("timed out") || err_str.contains("Timeout") {
-                    eprintln!(
-                        "Token refresh timed out (attempt {}/{})",
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    last_error = Some(e);
-                } else {
-                    return Err(e).context("Failed to refresh token");
-                }
-            }
+            Err(error) => return Err(anyhow::Error::new(error)).context(error_context.to_string()),
         }
     }
 
-    Err(last_error.unwrap()).context("Failed to refresh token after retries")
+    let fallback = "Unknown timeout".to_string();
+    let timeout_details = last_timeout.unwrap_or(fallback);
+    anyhow::bail!("{error_context} after retries: {timeout_details}")
+}
+
+async fn sleep_for_retry(attempt: u32) {
+    if attempt == 0 {
+        return;
+    }
+
+    let delay = Duration::from_secs(1 << attempt);
+    eprintln!("Retrying in {:?}...", delay);
+    tokio::time::sleep(delay).await;
+}
+
+fn log_timeout(timeout_label: &str, attempt: u32) {
+    eprintln!("{timeout_label} timed out (attempt {}/{})", attempt, MAX_RETRIES);
+}
+
+fn is_timeout_error(error: &impl std::fmt::Debug) -> bool {
+    let error_text = format!("{error:?}");
+    error_text.contains("timed out") || error_text.contains("Timeout")
 }

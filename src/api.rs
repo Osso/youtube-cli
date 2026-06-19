@@ -227,36 +227,9 @@ impl Client {
         page_token: Option<&str>,
     ) -> Result<PlaylistItemsResult> {
         let max_str = max_results.to_string();
-        let mut params = vec![
-            ("part", "snippet"),
-            ("playlistId", playlist_id),
-            ("maxResults", &max_str),
-        ];
-        if let Some(token) = page_token {
-            params.push(("pageToken", token));
-        }
-
+        let params = build_playlist_items_params(playlist_id, &max_str, page_token);
         let data = self.get("playlistItems", &params).await?;
-
-        let items = data["items"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|item| PlaylistItem {
-                        playlist_item_id: item["id"].as_str().unwrap_or("").to_string(),
-                        video_id: item["snippet"]["resourceId"]["videoId"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string(),
-                        title: item["snippet"]["title"].as_str().unwrap_or("").to_string(),
-                        channel: item["snippet"]["videoOwnerChannelTitle"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let items = extract_playlist_items(&data);
 
         Ok(PlaylistItemsResult {
             items,
@@ -327,6 +300,44 @@ fn parse_video_detail(item: &serde_json::Value) -> VideoDetail {
             .unwrap_or("")
             .to_string(),
         description: item["snippet"]["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+fn build_playlist_items_params<'a>(
+    playlist_id: &'a str,
+    max_results: &'a str,
+    page_token: Option<&'a str>,
+) -> Vec<(&'static str, &'a str)> {
+    let mut params = vec![
+        ("part", "snippet"),
+        ("playlistId", playlist_id),
+        ("maxResults", max_results),
+    ];
+    if let Some(token) = page_token {
+        params.push(("pageToken", token));
+    }
+    params
+}
+
+fn extract_playlist_items(data: &serde_json::Value) -> Vec<PlaylistItem> {
+    data["items"]
+        .as_array()
+        .map(|arr| arr.iter().map(parse_playlist_item).collect())
+        .unwrap_or_default()
+}
+
+fn parse_playlist_item(item: &serde_json::Value) -> PlaylistItem {
+    PlaylistItem {
+        playlist_item_id: item["id"].as_str().unwrap_or("").to_string(),
+        video_id: item["snippet"]["resourceId"]["videoId"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+        title: item["snippet"]["title"].as_str().unwrap_or("").to_string(),
+        channel: item["snippet"]["videoOwnerChannelTitle"]
             .as_str()
             .unwrap_or("")
             .to_string(),
