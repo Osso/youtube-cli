@@ -3,8 +3,10 @@ mod auth;
 mod config;
 
 use anyhow::Result;
+#[cfg(not(test))]
 use clap::{Parser, Subcommand};
 
+#[cfg(not(test))]
 #[derive(Parser)]
 #[command(name = "youtube")]
 #[command(about = "CLI tool for YouTube Data API v3")]
@@ -17,6 +19,7 @@ struct Cli {
     command: Commands,
 }
 
+#[cfg(not(test))]
 #[derive(Subcommand)]
 enum Commands {
     /// Authenticate with YouTube (opens browser)
@@ -42,6 +45,7 @@ enum Commands {
     Playlist(PlaylistCommands),
 }
 
+#[cfg(not(test))]
 #[derive(Subcommand)]
 enum PlaylistCommands {
     /// List your playlists
@@ -73,6 +77,7 @@ enum PlaylistCommands {
     },
 }
 
+#[cfg(not(test))]
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -97,6 +102,7 @@ async fn main() -> Result<()> {
     }
 }
 
+#[cfg(not(test))]
 async fn cmd_login() -> Result<()> {
     let config = config::load_config()?;
     let tokens = auth::login(config.client_id(), config.client_secret()).await?;
@@ -105,6 +111,7 @@ async fn cmd_login() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(test))]
 async fn cmd_search(query: &str, max: u32, page: Option<&str>, json: bool) -> Result<()> {
     let mut client = api::Client::new().await?;
     let result = client.search(query, max, page).await?;
@@ -128,9 +135,11 @@ async fn cmd_search(query: &str, max: u32, page: Option<&str>, json: bool) -> Re
     if let Some(token) = &result.next_page_token {
         eprintln!("\nNext page: --page {}", token);
     }
+    eprintln!("Total results: {}", result.total_results);
     Ok(())
 }
 
+#[cfg(not(test))]
 async fn cmd_info(id: &str, json: bool) -> Result<()> {
     let mut client = api::Client::new().await?;
     let v = client.video_info(id).await?;
@@ -152,6 +161,7 @@ async fn cmd_info(id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(test))]
 async fn cmd_playlist_list(max: u32, json: bool) -> Result<()> {
     let mut client = api::Client::new().await?;
     let playlists = client.list_playlists(max).await?;
@@ -167,6 +177,7 @@ async fn cmd_playlist_list(max: u32, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(test))]
 async fn cmd_playlist_items(id: &str, max: u32, page: Option<&str>, json: bool) -> Result<()> {
     let mut client = api::Client::new().await?;
     let result = client.playlist_items(id, max, page).await?;
@@ -189,6 +200,7 @@ async fn cmd_playlist_items(id: &str, max: u32, page: Option<&str>, json: bool) 
     Ok(())
 }
 
+#[cfg(not(test))]
 async fn cmd_playlist_add(playlist_id: &str, video_ids: &[String], json: bool) -> Result<()> {
     let mut client = api::Client::new().await?;
     let added = client.playlist_add(playlist_id, video_ids).await?;
@@ -202,6 +214,7 @@ async fn cmd_playlist_add(playlist_id: &str, video_ids: &[String], json: bool) -
     Ok(())
 }
 
+#[cfg(not(test))]
 async fn cmd_playlist_remove(item_id: &str) -> Result<()> {
     let mut client = api::Client::new().await?;
     client.playlist_remove(item_id).await?;
@@ -245,4 +258,23 @@ fn format_duration(iso: &str) -> String {
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_duration_handles_seconds_minutes_and_hours() {
+        assert_eq!(format_duration("PT5S"), "0:05");
+        assert_eq!(format_duration("PT2M05S"), "2:05");
+        assert_eq!(format_duration("PT1H02M03S"), "1:02:03");
+        assert_eq!(format_duration("PT"), "0:00");
+        assert_eq!(format_duration("bad"), "0:00");
+    }
+
+    #[test]
+    fn print_json_accepts_serializable_values() {
+        print_json(&serde_json::json!({"ok": true})).unwrap();
+    }
 }

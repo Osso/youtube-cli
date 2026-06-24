@@ -5,6 +5,7 @@ use std::time::Duration;
 use crate::auth;
 use crate::config;
 
+#[cfg(not(test))]
 const BASE_URL: &str = "https://www.googleapis.com/youtube/v3";
 const MAX_RETRIES: u32 = 3;
 
@@ -12,9 +13,11 @@ pub struct Client {
     http: reqwest::Client,
     access_token: String,
     config: config::Config,
+    base_url: String,
 }
 
 impl Client {
+    #[cfg(not(test))]
     pub async fn new() -> Result<Self> {
         let config = config::load_config()?;
         let tokens = config::load_tokens().context("Not logged in. Run `youtube login` first.")?;
@@ -24,14 +27,28 @@ impl Client {
                 .build()?,
             access_token: tokens.access_token,
             config,
+            base_url: BASE_URL.to_string(),
         })
+    }
+
+    #[cfg(test)]
+    fn for_test(base_url: String, access_token: &str) -> Self {
+        Self {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("test client should build"),
+            access_token: access_token.to_string(),
+            config: config::Config::default(),
+            base_url,
+        }
     }
 
     async fn ensure_token(&mut self) -> Result<()> {
         // Try a lightweight call; if 401, refresh
         let resp = self
             .http
-            .get(format!("{}/channels", BASE_URL))
+            .get(format!("{}/channels", self.base_url))
             .query(&[("part", "id"), ("mine", "true")])
             .bearer_auth(&self.access_token)
             .send()
@@ -91,7 +108,7 @@ impl Client {
     }
 
     async fn get(&mut self, path: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
-        let url = format!("{}/{}", BASE_URL, path);
+        let url = format!("{}/{}", self.base_url, path);
         let params = params.to_vec();
         self.send_with_retry(|http, token| http.get(&url).query(&params).bearer_auth(token))
             .await
@@ -103,7 +120,7 @@ impl Client {
         params: &[(&str, &str)],
         body: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let url = format!("{}/{}", BASE_URL, path);
+        let url = format!("{}/{}", self.base_url, path);
         let params = params.to_vec();
         let body = body.clone();
         self.send_with_retry(|http, token| {
@@ -120,7 +137,7 @@ impl Client {
 
         let resp = self
             .http
-            .delete(format!("{}/{}", BASE_URL, path))
+            .delete(format!("{}/{}", self.base_url, path))
             .query(params)
             .bearer_auth(&self.access_token)
             .send()
@@ -382,4 +399,297 @@ pub struct PlaylistItemsResult {
     pub items: Vec<PlaylistItem>,
     pub next_page_token: Option<String>,
     pub total_results: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    #[tokio::test]
+    async fn search_fetches_details_and_preserves_pagination() {
+        let server = MockYoutube::start(handler);
+        let mut client = Client::for_test(server.base_url(), "token");
+
+        let result = client.search("rust", 2, Some("page-1")).await.unwrap();
+
+        assert_eq!(result.next_page_token.as_deref(), Some("page-2"));
+        assert_eq!(result.total_results, 10);
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.items[0].id, "v1");
+        assert_eq!(result.items[1].title, "Second");
+        let requests = server.requests();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("GET /channels?part=id&mine=true"))
+        );
+        assert!(requests.iter().any(|request| {
+            request.contains("GET /search?")
+                && request.contains("q=rust")
+                && request.contains("pageToken=page-1")
+        }));
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("GET /videos?") && request.contains("id=v1%2Cv2"))
+        );
+    }
+
+    #[tokio::test]
+    async fn search_returns_empty_items_without_detail_call() {
+        fn empty_search(line: &str, _body: &str) -> (&'static str, String) {
+            if line.starts_with("GET /channels") {
+                ("200 OK", "{}".to_string())
+            } else if line.starts_with("GET /search") {
+                (
+                    "200 OK",
+                    serde_json::json!({
+                        "items": [],
+                        "pageInfo": {"totalResults": 0}
+                    })
+                    .to_string(),
+                )
+            } else {
+                ("500 Internal Server Error", error_body("unexpected"))
+            }
+        }
+        let server = MockYoutube::start(empty_search);
+        let mut client = Client::for_test(server.base_url(), "token");
+
+        let result = client.search("none", 2, None).await.unwrap();
+
+        assert!(result.items.is_empty());
+        assert_eq!(result.total_results, 0);
+        assert!(
+            !server
+                .requests()
+                .iter()
+                .any(|request| request.contains("GET /videos?"))
+        );
+    }
+
+    #[tokio::test]
+    async fn video_info_reports_missing_video() {
+        let server = MockYoutube::start(handler);
+        let mut client = Client::for_test(server.base_url(), "token");
+
+        let err = client.video_info("missing").await.unwrap_err();
+
+        assert!(err.to_string().contains("Video not found: missing"));
+    }
+
+    #[tokio::test]
+    async fn playlists_and_items_parse_api_responses() {
+        let server = MockYoutube::start(handler);
+        let mut client = Client::for_test(server.base_url(), "token");
+
+        let playlists = client.list_playlists(5).await.unwrap();
+        let items = client
+            .playlist_items("pl-1", 5, Some("items-page"))
+            .await
+            .unwrap();
+
+        assert_eq!(playlists[0].id, "pl-1");
+        assert_eq!(playlists[0].count, 2);
+        assert_eq!(items.items[0].playlist_item_id, "pli-1");
+        assert_eq!(items.next_page_token.as_deref(), Some("items-next"));
+        assert_eq!(items.total_results, 2);
+    }
+
+    #[tokio::test]
+    async fn playlist_add_and_remove_send_expected_requests() {
+        let server = MockYoutube::start(handler);
+        let mut client = Client::for_test(server.base_url(), "token");
+
+        let added = client
+            .playlist_add("pl-1", &["v1".to_string(), "v2".to_string()])
+            .await
+            .unwrap();
+        client.playlist_remove("pli-1").await.unwrap();
+
+        assert_eq!(added, vec!["v1", "v2"]);
+        let requests = server.requests();
+        assert!(requests.iter().any(|request| {
+            request.starts_with("POST /playlistItems?part=snippet")
+                && request.contains("\"playlistId\":\"pl-1\"")
+                && request.contains("\"videoId\":\"v1\"")
+        }));
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.starts_with("DELETE /playlistItems?id=pli-1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn api_error_uses_google_error_message() {
+        fn failing(line: &str, _body: &str) -> (&'static str, String) {
+            if line.starts_with("GET /channels") {
+                ("200 OK", "{}".to_string())
+            } else {
+                ("403 Forbidden", error_body("quota exceeded"))
+            }
+        }
+        let server = MockYoutube::start(failing);
+        let mut client = Client::for_test(server.base_url(), "token");
+
+        let err = client.list_playlists(5).await.unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("API error 403 Forbidden: quota exceeded")
+        );
+    }
+
+    fn handler(line: &str, body: &str) -> (&'static str, String) {
+        if line.starts_with("GET /channels") {
+            return ("200 OK", "{}".to_string());
+        }
+        if line.starts_with("GET /search") {
+            return ("200 OK", search_response());
+        }
+        if line.starts_with("GET /videos") && line.contains("missing") {
+            return ("200 OK", serde_json::json!({"items": []}).to_string());
+        }
+        if line.starts_with("GET /videos") {
+            return ("200 OK", videos_response());
+        }
+        if line.starts_with("GET /playlists") {
+            return ("200 OK", playlists_response());
+        }
+        if line.starts_with("GET /playlistItems") {
+            return ("200 OK", playlist_items_response());
+        }
+        if line.starts_with("POST /playlistItems") {
+            assert!(body.contains("\"kind\":\"youtube#video\""));
+            return ("200 OK", "{}".to_string());
+        }
+        if line.starts_with("DELETE /playlistItems") {
+            return ("204 No Content", String::new());
+        }
+        ("500 Internal Server Error", error_body("unexpected"))
+    }
+
+    fn search_response() -> String {
+        serde_json::json!({
+            "items": [
+                {"id": {"videoId": "v1"}},
+                {"id": {"videoId": "v2"}}
+            ],
+            "nextPageToken": "page-2",
+            "pageInfo": {"totalResults": 10}
+        })
+        .to_string()
+    }
+
+    fn videos_response() -> String {
+        serde_json::json!({
+            "items": [
+                video_detail("v1", "First"),
+                video_detail("v2", "Second")
+            ]
+        })
+        .to_string()
+    }
+
+    fn playlists_response() -> String {
+        serde_json::json!({
+            "items": [
+                {"id": "pl-1", "snippet": {"title": "Playlist"}, "contentDetails": {"itemCount": 2}}
+            ]
+        })
+        .to_string()
+    }
+
+    fn playlist_items_response() -> String {
+        serde_json::json!({
+            "items": [
+                {
+                    "id": "pli-1",
+                    "snippet": {
+                        "resourceId": {"videoId": "v1"},
+                        "title": "First",
+                        "videoOwnerChannelTitle": "Owner"
+                    }
+                }
+            ],
+            "nextPageToken": "items-next",
+            "pageInfo": {"totalResults": 2}
+        })
+        .to_string()
+    }
+
+    fn video_detail(id: &str, title: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "snippet": {
+                "title": title,
+                "channelTitle": "Channel",
+                "publishedAt": "2026-01-02",
+                "description": "Description"
+            },
+            "contentDetails": {"duration": "PT1M02S"},
+            "statistics": {"viewCount": "123"}
+        })
+    }
+
+    fn error_body(message: &str) -> String {
+        serde_json::json!({"error": {"message": message}}).to_string()
+    }
+
+    struct MockYoutube {
+        addr: SocketAddr,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockYoutube {
+        fn start(handler: fn(&str, &str) -> (&'static str, String)) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let thread_requests = Arc::clone(&requests);
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    handle_connection(stream, &thread_requests, handler);
+                }
+            });
+            Self { addr, requests }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn handle_connection(
+        mut stream: std::net::TcpStream,
+        requests: &Arc<Mutex<Vec<String>>>,
+        handler: fn(&str, &str) -> (&'static str, String),
+    ) {
+        let mut buffer = [0_u8; 16384];
+        let bytes = stream.read(&mut buffer).unwrap();
+        let request = String::from_utf8_lossy(&buffer[..bytes]).to_string();
+        let request_line = request.lines().next().unwrap_or_default().to_string();
+        requests.lock().unwrap().push(request.clone());
+        let body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or_default()
+            .to_string();
+        let (status, response_body) = handler(&request_line, &body);
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    }
 }

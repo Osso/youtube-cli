@@ -1,21 +1,31 @@
 use anyhow::{Context, Result};
+#[cfg(not(test))]
 use oauth2::basic::BasicClient;
+#[cfg(not(test))]
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
 };
 use std::future::Future;
+#[cfg(not(test))]
 use std::io::{BufRead, BufReader, Write};
+#[cfg(not(test))]
 use std::net::TcpListener;
 use std::time::Duration;
+#[cfg(not(test))]
 use url::Url;
 
-use crate::config::{self, Tokens};
+#[cfg(not(test))]
+use crate::config;
+use crate::config::Tokens;
 
+#[cfg(not(test))]
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+#[cfg(not(test))]
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const MAX_RETRIES: u32 = 3;
 
+#[cfg(not(test))]
 fn create_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -25,6 +35,7 @@ fn create_http_client() -> reqwest::Client {
         .expect("Client should build")
 }
 
+#[cfg(not(test))]
 pub async fn login(client_id: &str, client_secret: &str) -> Result<Tokens> {
     let listener = TcpListener::bind("127.0.0.1:0").context("Failed to bind to local port")?;
     let port = listener.local_addr()?.port();
@@ -41,12 +52,11 @@ pub async fn login(client_id: &str, client_secret: &str) -> Result<Tokens> {
 
     let (auth_url, csrf_token) = client
         .authorize_url(CsrfToken::new_random)
-        .add_scope(Scope::new("https://www.googleapis.com/auth/youtube".to_string()))
+        .add_scope(youtube_scope())
         .set_pkce_challenge(pkce_challenge)
         .url();
 
     open_auth_browser(auth_url.as_str())?;
-
     let code = wait_for_callback(listener, csrf_token)?;
     let token_result = retry_request(
         "Failed to exchange code for token",
@@ -66,12 +76,19 @@ pub async fn login(client_id: &str, client_secret: &str) -> Result<Tokens> {
     Ok(tokens)
 }
 
+#[cfg(not(test))]
+fn youtube_scope() -> Scope {
+    Scope::new("https://www.googleapis.com/auth/youtube".to_string())
+}
+
+#[cfg(not(test))]
 fn open_auth_browser(auth_url: &str) -> Result<()> {
     println!("Opening browser for authentication...");
     open::that(auth_url)?;
     Ok(())
 }
 
+#[cfg(not(test))]
 fn wait_for_callback(listener: TcpListener, expected_csrf: CsrfToken) -> Result<AuthorizationCode> {
     let port = listener.local_addr()?.port();
     println!("Waiting for OAuth callback on port {}...", port);
@@ -110,6 +127,7 @@ fn wait_for_callback(listener: TcpListener, expected_csrf: CsrfToken) -> Result<
     Ok(code)
 }
 
+#[cfg(not(test))]
 pub async fn refresh_token(client_id: &str, client_secret: &str, refresh: &str) -> Result<Tokens> {
     let client = BasicClient::new(ClientId::new(client_id.to_string()))
         .set_client_secret(ClientSecret::new(client_secret.to_string()))
@@ -137,6 +155,19 @@ pub async fn refresh_token(client_id: &str, client_secret: &str, refresh: &str) 
     Ok(tokens)
 }
 
+#[cfg(test)]
+pub async fn refresh_token(
+    _client_id: &str,
+    _client_secret: &str,
+    refresh: &str,
+) -> Result<Tokens> {
+    Ok(Tokens {
+        access_token: format!("refreshed-{refresh}"),
+        refresh_token: refresh.to_string(),
+    })
+}
+
+#[cfg(not(test))]
 fn tokens_from_login_exchange<T: TokenResponse>(token_result: T) -> Result<Tokens> {
     let refresh_token = token_result
         .refresh_token()
@@ -190,10 +221,71 @@ async fn sleep_for_retry(attempt: u32) {
 }
 
 fn log_timeout(timeout_label: &str, attempt: u32) {
-    eprintln!("{timeout_label} timed out (attempt {}/{})", attempt, MAX_RETRIES);
+    eprintln!(
+        "{timeout_label} timed out (attempt {}/{})",
+        attempt, MAX_RETRIES
+    );
 }
 
 fn is_timeout_error(error: &impl std::fmt::Debug) -> bool {
     let error_text = format!("{error:?}");
     error_text.contains("timed out") || error_text.contains("Timeout")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fmt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug)]
+    struct TestError(&'static str);
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl std::error::Error for TestError {}
+
+    #[test]
+    fn timeout_detection_matches_debug_text() {
+        assert!(is_timeout_error(&TestError("operation timed out")));
+        assert!(is_timeout_error(&TestError("Timeout while connecting")));
+        assert!(!is_timeout_error(&TestError("permission denied")));
+    }
+
+    #[tokio::test]
+    async fn retry_request_returns_success_without_retry() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+
+        let value = retry_request("context", "timeout", move || {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, TestError>("ok")
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(value, "ok");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_request_wraps_non_timeout_error() {
+        let err = retry_request("exchange failed", "timeout", || async {
+            Err::<(), _>(TestError("bad request"))
+        })
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("exchange failed"));
+    }
 }
